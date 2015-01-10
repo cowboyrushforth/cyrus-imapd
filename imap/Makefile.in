@@ -267,9 +267,9 @@ smmapd: smmapd.o libimap.a mutex_fake.o $(DEPLIBS) $(SERVICE)
 	$(CC) $(LDFLAGS) -o smmapd $(SERVICE) smmapd.o mutex_fake.o libimap.a \
 	$(DEPLIBS) $(LIBS) $(LIB_WRAP)
 
-httpd: $(HTTP_OBJS) proxy.o backend.o index.o spool.o tls.o mutex_fake.o \
+httpd: $(HTTP_OBJS) zoneinfo_db.o proxy.o backend.o index.o spool.o tls.o mutex_fake.o \
 	 libimap.a $(DEPLIBS) $(SERVICE)
-	$(CC) $(LDFLAGS) -o httpd $(HTTP_OBJS) \
+	$(CC) $(LDFLAGS) -o httpd $(HTTP_OBJS) zoneinfo_db.o \
 	 proxy.o backend.o index.o spool.o tls.o mutex_fake.o libimap.a \
 	 $(SERVICE) $(DEPLIBS) $(LIBS) $(LIB_WRAP) $(HTTP_LIBS)
 
