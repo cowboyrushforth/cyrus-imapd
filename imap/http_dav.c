@@ -5325,7 +5325,7 @@ static int principal_search(char *mboxname,
     if (!(p = mboxname_isusermailbox(mboxname, 1))) return 0;
 
     strlcpy(userid, p, MAX_MAILBOX_NAME+1);
-    mboxname_hiersep_toexternal(&httpd_namespace, userid, 0);
+    //mboxname_hiersep_toexternal(&httpd_namespace, userid, 0);
 
     for (search_crit = (struct search_crit *) fctx->filter_crit;
 	 search_crit; search_crit = search_crit->next) {

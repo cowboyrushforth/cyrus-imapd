@@ -377,8 +377,9 @@ static void my_carddav_auth(const char *userid)
     }
 
     /* Auto-provision an addressbook for 'userid' */
-    strlcpy(ident, userid, sizeof(ident));
+    strlcpy(ident, userid, strcspn(userid, "@"));
     mboxname_hiersep_toexternal(&httpd_namespace, ident, 0);
+    strlcpy(ident + strlen(ident), userid + strlen(ident), sizeof(ident) - strlen(ident));
 
     /* addressbook-home-set */
     len += snprintf(mailboxname+len, MAX_MAILBOX_BUFFER - len, ".%s",
@@ -470,6 +471,10 @@ static int carddav_parse_path(const char *path,
     char *p;
     size_t len, siz;
     static const char *prefix = NULL;
+    char userid[MAX_MAILBOX_BUFFER];
+    char userdomain[MAX_MAILBOX_BUFFER];
+    char *domain_start;
+    int userlen, domainlen;
 
     /* Make a working copy of target path */
     strlcpy(tgt->path, path, sizeof(tgt->path));
@@ -555,13 +560,20 @@ static int carddav_parse_path(const char *path,
     p = tgt->mboxname;
     siz = MAX_MAILBOX_BUFFER;
     if (tgt->user) {
-	len = snprintf(p, siz, "user");
-	p += len;
-	siz -= len;
-
 	if (tgt->userlen) {
-	    len = snprintf(p, siz, ".%.*s", (int) tgt->userlen, tgt->user);
-	    mboxname_hiersep_tointernal(&httpd_namespace, p+1, tgt->userlen);
+	    domain_start = strchr(tgt->user, '@');
+	    if (domain_start != NULL) {
+		userlen = domain_start - tgt->user + 1;
+		domain_start++;
+		domainlen = tgt->userlen - userlen + 1;
+	        strlcpy(userid, tgt->user, userlen);
+	        mboxname_hiersep_tointernal(&httpd_namespace, userid, userlen);
+		strlcpy(userdomain, domain_start, domainlen);
+	        len = snprintf(p, siz, "%.*s!user.%.*s", (int) domainlen, userdomain, (int) userlen, userid);
+            } else {
+	        len = snprintf(p, siz, "user.%.*s", (int) tgt->userlen, tgt->user);
+	        mboxname_hiersep_tointernal(&httpd_namespace, p+5, tgt->userlen);
+            }
 	    p += len;
 	    siz -= len;
 	}
