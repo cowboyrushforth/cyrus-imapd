@@ -76,10 +76,12 @@
 #define TZDIST_WELLKNOWN_URI "/.well-known/timezone"
 
 static time_t compile_time;
+static unsigned synctoken_prefix;
 static void tzdist_init(struct buf *serverinfo);
 static void tzdist_shutdown(void);
 static int meth_get(struct transaction_t *txn, void *params);
 static int action_capa(struct transaction_t *txn);
+static int action_leap(struct transaction_t *txn);
 static int action_list(struct transaction_t *txn);
 static int action_get(struct transaction_t *txn);
 static int action_expand(struct transaction_t *txn);
@@ -102,6 +104,7 @@ static const struct action_t {
     int (*proc)(struct transaction_t *txn);
 } actions[] = {
     { "capabilities",	0,	&action_capa },
+    { "leapseconds",	0,	&action_leap },
     { "zones",		0,	&action_list },
     { "zones",		1,	&action_get },
     { "observances",	1,	&action_expand },
@@ -155,6 +158,8 @@ struct namespace_t namespace_tzdist = {
 
 static void tzdist_init(struct buf *serverinfo __attribute__((unused)))
 {
+    struct buf buf = BUF_INITIALIZER;
+
     namespace_tzdist.enabled =
 	config_httpmodules & IMAP_ENUM_HTTPMODULES_TZDIST;
 
@@ -167,6 +172,10 @@ static void tzdist_init(struct buf *serverinfo __attribute__((unused)))
     }
 
     compile_time = calc_compile_time(__TIME__, __DATE__);
+
+    buf_printf(&buf, "Cyrus TZdist: %s", config_servername);
+    synctoken_prefix = strhash(buf_cstring(&buf));
+    buf_free(&buf);
 
     initialize_tz_error_table();
 }
@@ -204,6 +213,9 @@ static int meth_get(struct transaction_t *txn,
 
 	if (!strcmp(tgt->collection, "capabilities")) {
 	    if (!*p) action = &action_capa;
+	}
+	else if (!strcmp(tgt->collection, "leapseconds")) {
+	    if (!*p) action = &action_leap;
 	}
 	else if (!strcmp(tgt->collection, "zones")) {
 	    if (!*p) {
@@ -271,6 +283,7 @@ static int action_capa(struct transaction_t *txn)
 	txn->resp_body.lastmod = compile_time;
 	txn->resp_body.maxage = 86400;  /* 24 hrs */
 	txn->flags.cc |= CC_MAXAGE;
+	if (!httpd_userisanonymous) txn->flags.cc |= CC_PUBLIC;
 
 	if (precond != HTTP_NOT_MODIFIED) break;
 
@@ -287,6 +300,9 @@ static int action_capa(struct transaction_t *txn)
 
 	/* Get info record from the database */
 	if ((r = zoneinfo_lookup_info(&info))) return HTTP_SERVER_ERROR;
+
+	buf_reset(&txn->buf);
+	buf_printf(&txn->buf, "%s:%s", info.data->s, info.data->next->s);
 
 	/* Construct our response */
 	root = json_pack("{ s:i"			/* version */
@@ -314,11 +330,14 @@ static int action_capa(struct transaction_t *txn)
 			 "    {s:s s:s s:["		/*   find */
 			 "      {s:s s:b}"		/*     pattern */
 			 "    ]}"
+			 "    {s:s s:s s:["		/*   leapseconds */
+			 "    ]}"
 			 "  ]}",
 
 			 "version", 1,
 
-			 "info", "primary-source", info.data->s, "formats",
+			 "info",
+			 "primary-source", buf_cstring(&txn->buf), "formats",
 			 "truncated", "any", 1, "untruncated", 1,
 //			 "provider-details", "", "contacts",
 
@@ -343,7 +362,11 @@ static int action_capa(struct transaction_t *txn)
 
 			 "name", "find",
 			 "uri-template", "/zones{?pattern}", "parameters",
-			 "name", "pattern", "required", 1);
+			 "name", "pattern", "required", 1,
+
+			 "name", "leapseconds",
+			 "uri-template", "/leapseconds", "parameters");
+
 	freestrlist(info.data);
 
 	if (!root) {
@@ -367,7 +390,116 @@ static int action_capa(struct transaction_t *txn)
     return json_response(precond, txn, root, &resp);
 }
 
+
+/* Perform a leapseconds action */
+static int action_leap(struct transaction_t *txn)
+{
+    int r, ret = 0, precond;
+    struct resp_body_t *resp_body = &txn->resp_body;
+    struct zoneinfo info, leap;
+
+    /* Get info record from the database */
+    if ((r = zoneinfo_lookup_info(&info))) return HTTP_SERVER_ERROR;
+
+    /* Get leap record from the database */
+    if ((r = zoneinfo_lookup_leap(&leap))) {
+	ret = (r == CYRUSDB_NOTFOUND ? HTTP_NOT_FOUND : HTTP_SERVER_ERROR);
+	goto done;
+    }
+
+    /* Check any preconditions, including range request */
+    txn->flags.ranges = 1;
+    precond = check_precond(txn, leap.data->s, leap.dtstamp);
+
+    switch (precond) {
+    case HTTP_OK:
+    case HTTP_PARTIAL:
+    case HTTP_NOT_MODIFIED:
+	/* Fill in ETag, Last-Modified, and Expires */
+	resp_body->etag = leap.data->s;
+	resp_body->lastmod = leap.dtstamp;
+	resp_body->maxage = 86400;  /* 24 hrs */
+	txn->flags.cc |= CC_MAXAGE | CC_REVALIDATE;
+	if (!httpd_userisanonymous) txn->flags.cc |= CC_PUBLIC;
+
+	if (precond != HTTP_NOT_MODIFIED) break;
+
+    default:
+	/* We failed a precondition - don't perform the request */
+	resp_body->type = NULL;
+	ret = precond;
+	goto done;
+    }
+
+
+    if (txn->meth != METH_HEAD) {
+	json_t *root, *expires, *leapseconds;
+	char buf[1024];
+	FILE *fp;
+
+	snprintf(buf, sizeof(buf), "%s%s%s",
+		 config_dir, FNAME_ZONEINFODIR, FNAME_LEAPSECFILE);
+	if (!(fp = fopen(buf, "r"))) {
+	    syslog(LOG_ERR, "Failed to open file %s", buf);
+	    ret = HTTP_NOT_FOUND;
+	    goto done;
+	}
+
+	/* Construct our response */
+	root = json_pack("{s:s s:s s:s s:[]}",
+			 "expires", "", "publisher", info.data->s,
+			 "version", info.data->next->s, "leapseconds");
+	if (!root) {
+	    txn->error.desc = "Unable to create JSON response";
+	    ret = HTTP_SERVER_ERROR;
+	    fclose(fp);
+	    goto done;
+	}
+
+	expires = json_object_get(root, "expires");
+	leapseconds = json_object_get(root, "leapseconds");
+
+	while (fgets(buf, sizeof(buf), fp)) {
+	    unsigned long epoch;
+
+	    if (buf[0] == '#') {
+		/* comment line */
+
+		if (buf[1] == '@') {
+		    /* expires */
+		    sscanf(buf+2, "\t%lu", &epoch);
+		    json_string_set(expires,
+				    rfc3339date_gen(buf, 11, /* clip time */
+						    epoch - NIST_EPOCH_OFFSET));
+		}
+	    }
+	    else if (isdigit(buf[0])) {
+		/* leap second */
+		int utcoff;
+		json_t *leap;
+
+		sscanf(buf, "%lu\t%d", &epoch, &utcoff);
+		leap = json_pack("{s:i s:s}", "utc-offset", utcoff, "onset",
+				 rfc3339date_gen(buf, 11, /* clip time */
+						 epoch - NIST_EPOCH_OFFSET));
+		json_array_append_new(leapseconds, leap);
+	    }
+	}
+	fclose(fp);
+
+	/* Output the JSON object */
+	ret = json_response(precond, txn, root, NULL);
+    }
+
+  done:
+    freestrlist(leap.data);
+    freestrlist(info.data);
+    return ret;
+}
+
+
 struct list_rock {
+    struct strlist *meta;
     json_t *tzarray;
     struct hash_table *tztable;
 };
@@ -376,7 +508,7 @@ static int list_cb(const char *tzid, int tzidlen,
 		   struct zoneinfo *zi, void *rock)
 {
     struct list_rock *lrock = (struct list_rock *) rock;
-    char tzidbuf[200], lastmod[21];
+    char tzidbuf[200], etag[32], lastmod[21];
     json_t *tz;
 
     if (lrock->tztable) {
@@ -385,9 +517,12 @@ static int list_cb(const char *tzid, int tzidlen,
     }
 
     strlcpy(tzidbuf, tzid, tzidlen+1);
+    sprintf(etag, "%u-%ld", strhash(tzid), zi->dtstamp);
     rfc3339date_gen(lastmod, sizeof(lastmod), zi->dtstamp);
 
-    tz = json_pack("{s:s s:s}", "tzid", tzidbuf, "last-modified", lastmod);
+    tz = json_pack("{s:s s:s s:s s:s s:s}",
+		   "tzid", tzidbuf, "etag", etag, "last-modified", lastmod,
+		   "publisher", lrock->meta->s, "version", lrock->meta->next->s);
     json_array_append_new(lrock->tzarray, tz);
 
     if (zi->data) {
@@ -407,14 +542,16 @@ static int list_cb(const char *tzid, int tzidlen,
 /* Perform a list action */
 static int action_list(struct transaction_t *txn)
 {
-    int r, precond;
+    int r, ret, precond;
     struct strlist *param;
     const char *pattern = NULL;
-    icaltimetype changedsince = icaltime_null_time();
     struct resp_body_t *resp_body = &txn->resp_body;
     struct zoneinfo info;
-    time_t lastmod;
+    time_t changedsince = 0, lastmod;
     json_t *root = NULL;
+
+    /* Get info record from the database */
+    if ((r = zoneinfo_lookup_info(&info))) return HTTP_SERVER_ERROR;
 
     /* Sanity check the parameters */
     if ((param = hash_lookup("pattern", &txn->req_qparams))) {
@@ -426,21 +563,24 @@ static int action_list(struct transaction_t *txn)
 	pattern = param->s;
     }
     else if ((param = hash_lookup("changedsince", &txn->req_qparams))) {
-	changedsince = icaltime_from_string(param->s);
-	if (param->next || !changedsince.is_utc) {  /* once only, UTC */
+	unsigned prefix = 0;
+
+	if (param->next) {  /* once only */
 	    return json_error_response(txn, TZ_INVALID_CHANGEDSINCE,
-				       param, &changedsince);
+				       param, NULL);
+	}
+
+	/* Parse and sanity check the changedsince token */
+	sscanf(param->s, "%u-%ld", &prefix, &changedsince);
+	if (prefix != synctoken_prefix || changedsince > info.dtstamp) {
+	    changedsince = 0;
 	}
     }
 
-    /* Get info record from the database */
-    if ((r = zoneinfo_lookup_info(&info))) return HTTP_SERVER_ERROR;
-
     /* Generate ETag & Last-Modified from info record */
     assert(!buf_len(&txn->buf));
-    buf_printf(&txn->buf, "%u-%ld", strhash(info.data->s), info.dtstamp);
+    buf_printf(&txn->buf, "%u-%ld", synctoken_prefix, info.dtstamp);
     lastmod = info.dtstamp;
-    freestrlist(info.data);
 
     /* Check any preconditions, including range request */
     txn->flags.ranges = 1;
@@ -455,30 +595,32 @@ static int action_list(struct transaction_t *txn)
 	resp_body->lastmod = lastmod;
 	resp_body->maxage = 86400;  /* 24 hrs */
 	txn->flags.cc |= CC_MAXAGE | CC_REVALIDATE;
-	if (httpd_userid) txn->flags.cc |= CC_PUBLIC;
+	if (!httpd_userisanonymous) txn->flags.cc |= CC_PUBLIC;
 
 	if (precond != HTTP_NOT_MODIFIED) break;
 
     default:
 	/* We failed a precondition - don't perform the request */
 	resp_body->type = NULL;
-	return precond;
+	ret = precond;
+	goto done;
     }
 
 
     if (txn->meth != METH_HEAD) {
-	struct list_rock lrock = { NULL, NULL };
+	struct list_rock lrock = { NULL, NULL, NULL };
 	struct hash_table tzids;
-	char dtstamp[21];
 
 	/* Start constructing our response */
-	rfc3339date_gen(dtstamp, sizeof(dtstamp), lastmod);
-	root = json_pack("{s:s s:[]}", "dtstamp", dtstamp, "timezones");
+	root = json_pack("{s:s s:[]}",
+			 "synctoken", resp_body->etag, "timezones");
 	if (!root) {
 	    txn->error.desc = "Unable to create JSON response";
-	    return HTTP_SERVER_ERROR;
+	    ret = HTTP_SERVER_ERROR;
+	    goto done;
 	}
 
+	lrock.meta = info.data;
 	lrock.tzarray = json_object_get(root, "timezones");
 	if (pattern) {
 	    construct_hash_table(&tzids, 500, 1);
@@ -486,14 +628,17 @@ static int action_list(struct transaction_t *txn)
 	}
 
 	/* Add timezones to array */
-	zoneinfo_find(pattern, !pattern,
-		      icaltime_as_timet(changedsince), &list_cb, &lrock);
+	zoneinfo_find(pattern, !pattern, changedsince, &list_cb, &lrock);
 
 	if (pattern) free_hash_table(&tzids, NULL);
     }
 
     /* Output the JSON object */
-    return json_response(precond, txn, root, NULL);
+    ret = json_response(precond, txn, root, NULL);
+
+  done:
+    freestrlist(info.data);
+    return ret;
 }
 
 
@@ -526,18 +671,6 @@ static int observance_compare(const void *obs1, const void *obs2)
 			    ((struct observance *) obs2)->onset);
 }
 
-static icalproperty *icalcomponent_get_x_property_by_name(icalcomponent *comp,
-							  const char *name)
-{
-    icalproperty *prop;
-
-    for (prop = icalcomponent_get_first_property(comp, ICAL_X_PROPERTY);
-	 prop && strcmp(icalproperty_get_x_name(prop), name);
-	 prop = icalcomponent_get_next_property(comp, ICAL_X_PROPERTY));
-
-    return prop;
-}
-
 static const struct observance *truncate_vtimezone(icalcomponent *vtz,
 						   icaltimetype *startp,
 						   icaltimetype *endp,
@@ -552,8 +685,14 @@ static const struct observance *truncate_vtimezone(icalcomponent *vtz,
     unsigned adjust_end = !icaltime_is_null_time(end);
 
     /* See if we have a proleptic tzname in VTIMEZONE */
-    proleptic_prop = icalcomponent_get_x_property_by_name(vtz,
-							  "X-PROLEPTIC-TZNAME");
+    for (prop = icalcomponent_get_first_property(vtz, ICAL_X_PROPERTY);
+	 prop;
+	 prop = icalcomponent_get_next_property(vtz, ICAL_X_PROPERTY)) {
+	if (!strcmp("X-PROLEPTIC-TZNAME", icalproperty_get_x_name(prop))) {
+	    proleptic_prop = prop;
+	    break;
+	}
+    }
 
     memset(&tombstone, 0, sizeof(struct observance));
     tombstone.name = icalmemory_tmp_copy(proleptic_prop ?
@@ -972,15 +1111,8 @@ static const struct observance *truncate_vtimezone(icalcomponent *vtz,
 	    *startp = obs->onset;
 	}
 	if (adjust_end) {
-	    /* Use X-TZUNTIL if exists, otherwise use last observance */
-	    prop = icalcomponent_get_x_property_by_name(vtz, "X-TZUNTIL");
-	    if (prop) {
-		*endp = icaltime_from_string(icalproperty_get_x(prop));
-	    }
-	    else {
-		obs = icalarray_element_at(obsarray, obsarray->num_elements-1);
-		*endp = obs->onset;
-	    }
+	    obs = icalarray_element_at(obsarray, obsarray->num_elements-1);
+	    *endp = obs->onset;
 	    icaltime_adjust(endp, 0, 0, 0, 1);
 	}
     }
@@ -1070,7 +1202,7 @@ static int action_get(struct transaction_t *txn)
 	resp_body->lastmod = lastmod;
 	resp_body->maxage = 86400;  /* 24 hrs */
 	txn->flags.cc |= CC_MAXAGE | CC_REVALIDATE;
-	if (httpd_userid) txn->flags.cc |= CC_PUBLIC;
+	if (!httpd_userisanonymous) txn->flags.cc |= CC_PUBLIC;
 
 	if (precond != HTTP_NOT_MODIFIED) break;
 
@@ -1137,22 +1269,12 @@ static int action_get(struct transaction_t *txn)
 	    }
 	}
 
-	/* Rename X-TZUNTIL (if exists) */
-	prop = icalcomponent_get_x_property_by_name(vtz, "X-TZUNTIL");
-	if (prop) icalproperty_set_x_name(prop, "TZUNTIL");
-
 	if (!icaltime_is_null_time(start) || !icaltime_is_null_time(end)) {
 
 	    if (!icaltime_is_null_time(end)) {
 		/* Add TZUNTIL to VTIMEZONE */
-		if (prop) {
-		    /* Use existing TZUNTIL */
-		    icalproperty_set_x(prop, icaltime_as_ical_string(end));
-		}
-		else {
-		    prop = icalproperty_new_tzuntil(end);
-		    icalcomponent_add_property(vtz, prop);
-		}
+		icalproperty *tzuntil = icalproperty_new_tzuntil(end);
+		icalcomponent_add_property(vtz, tzuntil);
 	    }
 
 	    /* Add truncation parameter(s) to TZURL */
@@ -1272,7 +1394,7 @@ static int action_expand(struct transaction_t *txn)
 	resp_body->lastmod = lastmod;
 	resp_body->maxage = 86400;  /* 24 hrs */
 	txn->flags.cc |= CC_MAXAGE | CC_REVALIDATE;
-	if (httpd_userid) txn->flags.cc |= CC_PUBLIC;
+	if (!httpd_userisanonymous) txn->flags.cc |= CC_PUBLIC;
 
 	if (precond != HTTP_NOT_MODIFIED) break;
 

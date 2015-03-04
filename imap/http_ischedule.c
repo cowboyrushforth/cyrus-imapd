@@ -591,6 +591,7 @@ int isched_send(struct sched_param *sparam, const char *recipient,
     static struct buf hdrs = BUF_INITIALIZER;
     const char *body, *uri, *originator;
     size_t bodylen;
+    icalproperty_method method;
     icalcomponent *comp;
     icalcomponent_kind kind;
     icalproperty *prop;
@@ -604,11 +605,14 @@ int isched_send(struct sched_param *sparam, const char *recipient,
     else uri = namespace_ischedule.prefix;
 
     /* Open connection to iSchedule receiver.
-       Use header buffer to construct remote server[:port][/tls] */
+       Use header buffer to construct remote server[:port][/tls][/noauth] */
     buf_setcstr(&txn.buf, sparam->server);
     if (sparam->port) buf_printf(&txn.buf, ":%u", sparam->port);
     if (sparam->flags & SCHEDTYPE_SSL) buf_appendcstr(&txn.buf, "/tls");
-    if (sparam->flags & SCHEDTYPE_REMOTE) buf_appendcstr(&txn.buf, "/noauth");
+    if (sparam->flags & SCHEDTYPE_REMOTE) {
+	/* Using DKIM rather than HTTP Auth */
+	buf_appendcstr(&txn.buf, "/noauth");
+    }
     be = proxy_findserver(buf_cstring(&txn.buf), &http_protocol, proxy_userid,
 			  &backend_cached, NULL, NULL, httpd_in);
     if (!be) return HTTP_UNAVAILABLE;
@@ -635,24 +639,21 @@ int isched_send(struct sched_param *sparam, const char *recipient,
 	       getpid(), time(NULL), send_count++, config_servername);
     buf_printf(&hdrs, "Content-Type: text/calendar; charset=utf-8");
 
+    method = icalcomponent_get_method(ical);
     comp = icalcomponent_get_first_real_component(ical);
     kind = icalcomponent_isa(comp);
-    buf_printf(&hdrs, "; method=REQUEST; component=%s\r\n",
+    buf_printf(&hdrs, "; method=%s; component=%s\r\n",
+	       /* XXX  Hack until we fix libical */
+	       method == ICAL_METHOD_POLLSTATUS ? "POLLSTATUS" :
+	       icalproperty_method_to_string(method),
 	       icalcomponent_kind_to_string(kind));
 
     buf_printf(&hdrs, "Content-Length: %u\r\n", (unsigned) bodylen);
 
     /* Determine Originator based on method and component */
-    if (icalcomponent_get_method(ical) == ICAL_METHOD_REPLY) {
-	if (icalcomponent_isa(comp) == ICAL_VPOLL_COMPONENT) {
-	    prop = icalcomponent_get_first_property(comp, ICAL_VOTER_PROPERTY);
-	    originator = icalproperty_get_voter(prop);
-	}
-	else {
-	    prop =
-		icalcomponent_get_first_property(comp, ICAL_ATTENDEE_PROPERTY);
-	    originator = icalproperty_get_attendee(prop);
-	}
+    if (method == ICAL_METHOD_REPLY) {
+	prop = icalcomponent_get_first_invitee(comp);
+	originator = icalproperty_get_invitee(prop);
     }
     else {
 	prop = icalcomponent_get_first_property(comp, ICAL_ORGANIZER_PROPERTY);
@@ -679,12 +680,6 @@ int isched_send(struct sched_param *sparam, const char *recipient,
 	}
 	buf_printf(&hdrs, "\r\n");
     }
-
-    buf_printf(&hdrs, "\r\n");
-
-  redirect:
-    /* Send request line */
-    prot_printf(be->out, "POST %s %s\r\n", uri, HTTP_VERSION);
 
     if (sparam->flags & SCHEDTYPE_REMOTE) {
 #ifdef WITH_DKIM
@@ -718,6 +713,7 @@ int isched_send(struct sched_param *sparam, const char *recipient,
 	    /* Process the headers and body */
 	    stat = dkim_chunk(dkim,
 			      (u_char *) buf_cstring(&hdrs), buf_len(&hdrs));
+	    stat = dkim_chunk(dkim, (u_char *) "\r\n", 2);
 	    stat = dkim_chunk(dkim, (u_char *) body, bodylen);
 	    stat = dkim_chunk(dkim, NULL, 0);
 	    stat = dkim_eom(dkim, NULL);
@@ -725,9 +721,8 @@ int isched_send(struct sched_param *sparam, const char *recipient,
 	    /* Generate the signature */
 	    stat = dkim_getsighdr_d(dkim, strlen(DKIM_SIGNHEADER) + 2,
 				    &sig, &siglen);
-
-	    /* Prepend a DKIM-Signature header */
-	    prot_printf(be->out, "%s: %s\r\n", DKIM_SIGNHEADER, sig);
+	    /* Append a DKIM-Signature header */
+	    buf_printf(&hdrs, "%s: %s\r\n", DKIM_SIGNHEADER, sig);
 
 	    dkim_free(dkim);
 	}
@@ -736,14 +731,22 @@ int isched_send(struct sched_param *sparam, const char *recipient,
 #endif /* WITH_DKIM */
     }
 
+  redirect:
+    /* Send request line */
+    prot_printf(be->out, "POST %s %s\r\n", uri, HTTP_VERSION);
+
     /* Send request headers and body */
     prot_putbuf(be->out, &hdrs);
+    prot_puts(be->out, "\r\n");
     prot_write(be->out, body, bodylen);
 
     /* Read response (req_hdr and req_body are actually the response) */
     txn.req_body.flags = BODY_DECODE;
     r = http_read_response(be, METH_POST, &code, NULL,
 			   &txn.req_hdrs, &txn.req_body, &txn.error.desc);
+    syslog(LOG_INFO, "isched_send(%s, %s) => %u",
+	   recipient, buf_cstring(&txn.buf), code);
+
     if (!r) {
 	switch (code) {
 	case 200:  /* Successful */
@@ -819,6 +822,8 @@ static DKIM_CBSTAT isched_get_key(DKIM *dkim, DKIM_SIGINFO *sig,
 	    buf_setcstr(&path, prefix);
 	    buf_printf(&path, "%s/%s/%s",
 		       namespace_domainkey.prefix, domain, selector);
+	    syslog(LOG_DEBUG, "using public key from path: %s",
+		   buf_cstring(&path));
 
 	    if (!(f = fopen(buf_cstring(&path), "r"))) {
 		syslog(LOG_NOTICE, "%s: fopen(): %s",
@@ -932,7 +937,7 @@ static int dkim_auth(struct transaction_t *txn)
 	DKIM_SIGINFO *sig = dkim_getsignature(dkim);
 
 	if (sig) {
-	    const char *sigerr;
+	    const char *sigerr, *sslerr;
 
 	    if (dkim_sig_getbh(sig) == DKIM_SIGBH_MISMATCH)
 		sigerr = "body hash mismatch";
@@ -945,6 +950,8 @@ static int dkim_auth(struct transaction_t *txn)
 	    assert(!buf_len(&txn->buf));
 	    buf_printf(&txn->buf, "%s: %s",
 		       dkim_getresultstr(stat), sigerr);
+	    if ((sslerr = dkim_sig_getsslbuf(sig)))
+		buf_printf(&txn->buf, ": %s", sslerr);
 	    txn->error.desc = buf_cstring(&txn->buf);
 	}
 	else txn->error.desc = dkim_getresultstr(stat);
@@ -1001,7 +1008,7 @@ static int meth_get_domainkey(struct transaction_t *txn,
 	resp_body->lastmod = sbuf.st_mtime;
 	resp_body->maxage = 86400;  /* 24 hrs */
 	txn->flags.cc |= CC_MAXAGE | CC_REVALIDATE;
-	if (httpd_userid) txn->flags.cc |= CC_PUBLIC;
+	if (!httpd_userisanonymous) txn->flags.cc |= CC_PUBLIC;
 
 	if (precond != HTTP_NOT_MODIFIED) break;
 
